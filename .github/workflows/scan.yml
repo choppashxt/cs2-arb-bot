@@ -25,6 +25,8 @@ jobs:
         env:
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          MIN_SPREAD_PCT: "15"
+          # TEMPORARY: lowered from 15 to 1 to test the Discord alert pipe.
+          # Restore to "15" once an alert has landed in the channel.
+          MIN_SPREAD_PCT: "1"
           MIN_ITEM_PRICE_USD: "5"
         run: python scanner.py
