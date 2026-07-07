@@ -1,0 +1,30 @@
+name: CS2 Arbitrage Scan
+
+on:
+  schedule:
+    # Runs every 15 minutes. GitHub Actions free tier gives 2000 min/month
+    # on private repos (unlimited on public repos) — 15 min interval uses
+    # well under that. Adjust the cron if you want it more/less frequent.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MIN_SPREAD_PCT: "15"
+          MIN_ITEM_PRICE_USD: "5"
+        run: python scanner.py

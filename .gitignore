@@ -1,0 +1,8 @@
+# Never commit real keys
+.env
+
+# Local Claude Code settings/permissions
+.claude/
+
+__pycache__/
+*.pyc

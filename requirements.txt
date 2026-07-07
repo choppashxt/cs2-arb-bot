@@ -1,0 +1,3 @@
+requests>=2.31.0
+Brotli>=1.1.0
+truststore>=0.9.0
