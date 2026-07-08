@@ -24,7 +24,11 @@ jobs:
       - name: Run scanner
         env:
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
+          # Optional — leave the secrets unset to skip DMarket.
+          DMARKET_PUBLIC_KEY: ${{ secrets.DMARKET_PUBLIC_KEY }}
+          DMARKET_SECRET_KEY: ${{ secrets.DMARKET_SECRET_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           MIN_SPREAD_PCT: "15"
           MIN_ITEM_PRICE_USD: "5"
+          REQUIRE_TRADABLE_NOW: "true"
         run: python scanner.py

@@ -1,11 +1,19 @@
 # CS2 Skin Arbitrage Scanner
 
-A read-only price scanner. It compares CS2 skin prices between **Skinport** and
-**CSFloat**, subtracts each platform's selling fee, and posts any spread that
-clears your threshold to a Discord channel.
+A read-only price scanner. It finds items you can **buy as a listing** on one
+platform and immediately **sell by filling a standing buy order (bid)** on
+another. Selling into a live buy order is an instant, guaranteed exit — someone
+is already committed to buying at that price — instead of listing and waiting.
+It subtracts the buy-order fill fee, and posts any spread that clears your
+threshold to a Discord channel.
 
-It **reports opportunities only** — it does not buy, sell, or trade anything.
-You execute manually.
+- **Buy side (acquire):** lowest listing — Skinport, CSFloat, DMarket.
+- **Sell side (exit):** highest buy order — CSFloat, DMarket. (Skinport has no
+  public buy-order API, so it's buy-side only. Buff163 is excluded — no official
+  public API, and scraping it is off the table.)
+
+It **reports opportunities only** — it does not buy, sell, place, or fill
+orders. You execute manually.
 
 ---
 
@@ -29,6 +37,8 @@ You execute manually.
 1. Python 3.11+
 2. A free **CSFloat API key** — from your CSFloat account settings
    (https://csfloat.com/api/docs). Skinport's price endpoint needs no key.
+   **DMarket** is optional — set `DMARKET_PUBLIC_KEY` + `DMARKET_SECRET_KEY`
+   (from DMarket account → Trading API) to include it; leave them blank to skip.
 3. A **Discord webhook URL** for alerts (optional — without it, results just
    print to the console).
 4. A **GitHub account** if you want it to run on a schedule for free.
@@ -91,15 +101,23 @@ Webhook → Copy Webhook URL.** Paste it as `DISCORD_WEBHOOK_URL`.
 
 All optional, set as environment variables or in `.env`:
 
-| Variable             | Default | What it does                                        |
-|----------------------|---------|-----------------------------------------------------|
-| `CSFLOAT_API_KEY`    | —       | Required. Reads CSFloat listings.                   |
-| `DISCORD_WEBHOOK_URL`| —       | Where alerts post. Omit to print to console only.   |
-| `MIN_SPREAD_PCT`     | `15`    | Minimum net spread (after fees) to report.          |
-| `MIN_ITEM_PRICE_USD` | `5`     | Ignore items cheaper than this.                     |
+| Variable                       | Default | What it does                                                        |
+|--------------------------------|---------|--------------------------------------------------------------------|
+| `CSFLOAT_API_KEY`              | —       | Reads CSFloat listings + buy orders.                               |
+| `CSFLOAT_BUY_ORDERS_ENABLED`   | `true`  | Use CSFloat as a sell venue (buy-order endpoint is unofficial).    |
+| `DMARKET_PUBLIC_KEY`           | —       | DMarket public key (optional; both DMarket keys needed).           |
+| `DMARKET_SECRET_KEY`           | —       | DMarket Ed25519 secret key.                                        |
+| `DISCORD_WEBHOOK_URL`          | —       | Where alerts post. Omit to print to console only.                  |
+| `MIN_SPREAD_PCT`               | `15`    | Minimum net spread (after fees) to report.                        |
+| `MIN_ITEM_PRICE_USD`           | `5`     | Ignore items cheaper than this.                                    |
+| `REQUIRE_TRADABLE_NOW`         | `true`  | Only flag cross-platform opps whose bought item is tradable now.   |
+| `TREAT_UNKNOWN_TRADABLE_AS_OK` | `false` | Keep opps where lock status is unknown (flagged) vs dropping them. |
+| `MIN_BUY_ORDER_DEPTH`          | `0`     | Require at least this many bids behind the top buy order.          |
 
-Fee percentages are set near the top of `scanner.py` (`SKINPORT_FEE_PCT`,
-`CSFLOAT_FEE_PCT`) — update them if either platform changes its fees.
+Buy-order fill fees are set near the top of `scanner.py`
+(`CSFLOAT_BUY_ORDER_FEE_PCT`, `DMARKET_BUY_ORDER_FEE_PCT`) — update them if a
+platform changes its fees. Run an offline pipeline test any time with
+`SCANNER_DRY_RUN=1 python scanner.py`.
 
 ---
 
@@ -110,5 +128,11 @@ Fee percentages are set near the top of `scanner.py` (`SKINPORT_FEE_PCT`,
   search URL.
 - CSFloat pagination uses their cursor-based scheme per the current docs
   (verified July 2026).
+- CSFloat's **buy-order** endpoint is not in their official docs — it's the
+  community-known internal one. Set `CSFLOAT_BUY_ORDERS_ENABLED=false` to use
+  CSFloat for listings only.
+- The buy-order rework has **not** been verified against live APIs yet (the
+  sandbox blocked egress). Confirm CSFloat/DMarket buy-order fields, price
+  units, trade-lock fields, and fill fees on a real run — see CLAUDE.md.
 - Steam Community Market is intentionally excluded as a sell destination (its
   7-day trade lock kills the quick-flip model).

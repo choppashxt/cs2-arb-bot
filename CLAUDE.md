@@ -4,10 +4,13 @@ This file is context for Claude Code. Read it before making changes.
 
 ## What this is
 
-A read-only price scanner comparing CS2 skin prices between Skinport and
-CSFloat. It nets out each platform's selling fee, filters for spreads above a
-threshold, and posts them to Discord. **It reports opportunities only — it does
-not buy, sell, or trade.** The human executes trades manually.
+A read-only price scanner for CS2 skins. It finds items you can BUY as a
+listing on one platform and immediately SELL by filling a standing BUY ORDER
+(bid) on another — selling into a live bid is an instant, guaranteed exit
+instead of listing-and-waiting. It nets out the buy-order fill fee, filters for
+spreads above a threshold, and posts them to Discord. **It reports
+opportunities only — it does not buy, sell, place, or fill orders.** The human
+executes trades manually.
 
 ## Current status
 
@@ -27,18 +30,45 @@ python scanner.py
 
 ## Architecture
 
-Single file: `scanner.py`
-- `fetch_skinport_prices()` — Skinport public items endpoint, no auth. Returns
-  `{item_name: min_price}`. Note: this feed is cached (~5 min) and rate-limited.
-- `fetch_csfloat_prices()` — CSFloat listings endpoint, needs an API key.
-  Returns `{item_name: (lowest_price, listing_url)}`. Paginates a few pages.
-- `find_opportunities()` — checks both directions (buy Skinport→sell CSFloat and
-  vice versa), applies fees, filters by `MIN_SPREAD_PCT` and `MIN_ITEM_PRICE_USD`.
-- `send_discord_alert()` — posts the top results to a Discord webhook, chunked
-  to stay under Discord's 2000-char message limit.
+Single file: `scanner.py`. Buy side = lowest listing; sell side = highest buy
+order (bid). Data model: `Listing`, `BuyOrder`, `Opportunity` dataclasses.
+
+Buy-side listing fetchers → `{name: Listing}`:
+- `fetch_skinport_listings()` — public items feed, no auth. No per-listing lock
+  info, so `tradable` is None (unknown). Cached ~5 min, rate-limited.
+- `fetch_csfloat_listings()` — listings endpoint, API key. Captures listing id
+  and `tradable`.
+- `fetch_dmarket_listings()` — market items, Ed25519-signed. Needs both DMarket
+  keys.
+
+Sell-side buy-order fetchers → `{name: BuyOrder}` (highest bid + depth):
+- `fetch_csfloat_buy_orders()` — per-item, uses CSFloat's INTERNAL buy-order
+  endpoint (NOT in official docs). Gate: `CSFLOAT_BUY_ORDERS_ENABLED`.
+- `fetch_dmarket_buy_orders()` — DMarket "targets-by-title", signed.
+- Skinport has no public buy-order API → buy-side only. Buff163 excluded (no
+  official public API — do NOT scrape).
+
+- `find_opportunities()` — pairs every listing (buy A) against every buy order
+  (sell B): `net = bid_B*(1-fee_B); spread = (net-listing_A)/listing_A`. Applies
+  `MIN_SPREAD_PCT`, `MIN_ITEM_PRICE_USD`, `MIN_BUY_ORDER_DEPTH`, and the
+  tradable-now gate on cross-platform opps. Classifies same-platform vs
+  cross-platform; sorts same-platform first, then cross by spread.
+- `_dmarket_signed_get()` — Ed25519 request signing (PyNaCl).
+- `build_mock_data()` + `SCANNER_DRY_RUN=1` — offline pipeline test, no network.
+- `send_discord_alert()` — posts top results, chunked under Discord's 2000-char limit.
 
 Deployment: `.github/workflows/scan.yml` runs it every 15 min on GitHub Actions,
 reading keys from repo secrets.
+
+## NOT yet verified against live APIs
+
+Egress was blocked when this was written, so the buy-order rework is UNVERIFIED
+against live endpoints. Confirm on a real run with keys:
+- CSFloat buy-order endpoint path + response shape (it's undocumented/internal).
+- DMarket listing/target field names, price units (assumed cents), trade-lock
+  field, and the buy-order fill fee.
+Every parser degrades to "skip this source" on error, so a wrong guess yields
+empty data rather than a crash.
 
 ## First tasks (do these before trusting output)
 
