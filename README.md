@@ -1,16 +1,24 @@
 # CS2 Skin Arbitrage Scanner
 
 A read-only price scanner. It finds items you can **buy as a listing** on one
-platform and immediately **sell by filling a standing buy order (bid)** on
-another. Selling into a live buy order is an instant, guaranteed exit — someone
-is already committed to buying at that price — instead of listing and waiting.
-It subtracts the buy-order fill fee, and posts any spread that clears your
-threshold to a Discord channel.
+platform and **sell at an achievable price** on another. Core rule: a seller's
+high asking price is not money you can collect — sell-side proceeds are only
+ever the **highest active buy order** minus the fill fee (**instant** exit), or
+the **lowest current ask** minus the listing fee, clearly marked **NOT
+INSTANT** (you'd undercut and wait for a buyer).
 
-- **Buy side (acquire):** lowest listing — Skinport, CSFloat, DMarket.
-- **Sell side (exit):** highest buy order — CSFloat, DMarket. (Skinport has no
-  public buy-order API, so it's buy-side only. Buff163 is excluded — no official
-  public API, and scraping it is off the table.)
+- **Buy side (acquire):** lowest listing — Skinport, CSFloat, DMarket, and
+  optionally CSGORoll (unofficial endpoint, off by default, coin prices
+  converted to cash and labeled).
+- **Instant sell (exit):** highest buy order — CSFloat, DMarket.
+- **Not-instant sell:** lowest ask — Skinport, CSFloat, DMarket.
+- Buff163 is excluded — no official public API, and scraping it is off the table.
+
+Every alert survives a set of **false-spread guards**: outlier rejection
+against a robust per-item reference price, an implausible-spread cap, recent-
+sales and order-depth liquidity floors, exact item/wear/StatTrak/Doppler-phase
+matching, and coin→cash normalization. Each run prints a summary of how many
+candidates were rejected and why.
 
 It **reports opportunities only** — it does not buy, sell, place, or fill
 orders. You execute manually.
@@ -104,20 +112,27 @@ All optional, set as environment variables or in `.env`:
 | Variable                       | Default | What it does                                                        |
 |--------------------------------|---------|--------------------------------------------------------------------|
 | `CSFLOAT_API_KEY`              | —       | Reads CSFloat listings + buy orders.                               |
-| `CSFLOAT_BUY_ORDERS_ENABLED`   | `true`  | Use CSFloat as a sell venue (buy-order endpoint is unofficial).    |
+| `CSFLOAT_BUY_ORDERS_ENABLED`   | `true`  | Use CSFloat as an instant sell venue (endpoint is unofficial).     |
 | `DMARKET_PUBLIC_KEY`           | —       | DMarket public key (optional; both DMarket keys needed).           |
 | `DMARKET_SECRET_KEY`           | —       | DMarket Ed25519 secret key.                                        |
+| `CSGOROLL_ENABLED`             | `false` | Read CSGORoll's unofficial endpoint (ToS risk — see .env.example). |
+| `CSGOROLL_COIN_USD`            | `0.66`  | Cash value per CSGORoll coin for price conversion.                 |
 | `DISCORD_WEBHOOK_URL`          | —       | Where alerts post. Omit to print to console only.                  |
 | `MIN_SPREAD_PCT`               | `15`    | Minimum net spread (after fees) to report.                        |
+| `MAX_PLAUSIBLE_SPREAD_PCT`     | `40`    | Spreads above this are logged as artifacts, never alerted.         |
+| `MAX_DEVIATION_PCT`            | `25`    | Drop listings/bids deviating more than this from the reference.    |
 | `MIN_ITEM_PRICE_USD`           | `5`     | Ignore items cheaper than this.                                    |
+| `MIN_RECENT_SALES`             | `3`     | Require this many sales in 7 days (where sales data exists).       |
+| `MIN_BUY_ORDER_DEPTH`          | `2`     | Require at least this many bids behind the top buy order.          |
 | `REQUIRE_TRADABLE_NOW`         | `true`  | Only flag cross-platform opps whose bought item is tradable now.   |
 | `TREAT_UNKNOWN_TRADABLE_AS_OK` | `false` | Keep opps where lock status is unknown (flagged) vs dropping them. |
-| `MIN_BUY_ORDER_DEPTH`          | `0`     | Require at least this many bids behind the top buy order.          |
+| `ALLOW_NOT_INSTANT`            | `true`  | Include list-and-wait exits, marked "NOT INSTANT".                 |
 
-Buy-order fill fees are set near the top of `scanner.py`
-(`CSFLOAT_BUY_ORDER_FEE_PCT`, `DMARKET_BUY_ORDER_FEE_PCT`) — update them if a
-platform changes its fees. Run an offline pipeline test any time with
-`SCANNER_DRY_RUN=1 python scanner.py`.
+Fees are env-configurable too: `CSFLOAT_BUY_ORDER_FEE_PCT`,
+`DMARKET_BUY_ORDER_FEE_PCT` (instant fills) and `SKINPORT_SELL_FEE_PCT`,
+`CSFLOAT_SELL_FEE_PCT`, `DMARKET_SELL_FEE_PCT` (not-instant listings). Run the
+offline pipeline test any time with `SCANNER_DRY_RUN=1 MIN_SPREAD_PCT=8 python
+scanner.py` — it exercises every accept path and rejection counter.
 
 ---
 

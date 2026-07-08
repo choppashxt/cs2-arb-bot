@@ -1,60 +1,81 @@
 """
-CS2 Skin Arbitrage Scanner — buy-order edition
-----------------------------------------------
-Finds items you can BUY as a listing on one platform and immediately SELL by
-filling a standing BUY ORDER (bid) on another. Selling into a live buy order is
-an instant, guaranteed exit (someone is already committed to buying at that
-price) instead of listing and waiting for a buyer — so a flagged spread is one
-you can actually realise now, not just on paper.
+CS2 Skin Arbitrage Scanner — buy-order edition, with false-spread guards
+------------------------------------------------------------------------
+Finds items you can BUY as a listing on one platform and SELL for real money on
+another, and only reports spreads you could actually transact at.
+
+The core correction (v3): a seller's high ASKING price is not money you can
+collect. Achievable sell-side proceeds are only ever one of:
+  (a) INSTANT   — fill the highest active buy order (bid), minus that
+                  platform's buy-order fill fee; or
+  (b) NOT-INSTANT — undercut/match the LOWEST current listing and wait for a
+                  buyer, minus the normal listing sale fee. Marked "not
+                  instant" because it needs a buyer to show up.
+The scanner never uses any ask above the lowest one as proceeds, and it never
+alerts on numbers that look like data artifacts (see guards below).
 
 This tool ONLY finds and reports opportunities. It never places, fills, or
 cancels an order. You execute every trade manually. (See CLAUDE.md guardrails.)
 
-Model
-    Buy side  (acquire): lowest current LISTING per item — Skinport, CSFloat, DMarket.
-    Sell side (exit)   : highest active BUY ORDER per item — CSFloat, DMarket.
-                         (Skinport has no public buy-order API, so it is a buy-side
-                          source only. Buff163 has the deepest book but no official
-                          public API — deliberately excluded, do NOT scrape it.)
+Sources
+    Buy side (listings): Skinport, CSFloat, DMarket, CSGORoll (optional, see below).
+    Sell side:
+      instant     — CSFloat buy orders, DMarket targets.
+      not-instant — lowest listing on Skinport / CSFloat / DMarket.
+    Buff163: excluded — no official public API (per CLAUDE.md, not scraped).
+    CSGORoll: has NO official public API. The owner explicitly authorized a
+      best-effort read of the unofficial GraphQL endpoint the site's own web
+      client uses. It is OFF by default (CSGOROLL_ENABLED). Prices are in site
+      COINS, not cash — they are converted via CSGOROLL_COIN_USD and marked
+      non-cash-equivalent; CSGORoll is never used as a sell venue. No
+      anti-detection of any kind: plain requests, no UA spoofing, no proxies;
+      if the site blocks the call we skip it. Expect ToS risk.
 
-Spread (per item, per direction):
-    net_proceeds = highest_buy_order_B * (1 - buy_order_sell_fee_B)
-    spread_pct   = (net_proceeds - lowest_listing_A) / lowest_listing_A * 100
-Flagged when spread_pct >= MIN_SPREAD_PCT.
+False-spread guards (each rejection is counted and summarized per run)
+    1. Robust reference price per item: median of {recent-sales median (Skinport
+       sales feed), platform reference prices, observed asks}. Any single
+       listing or bid deviating > MAX_DEVIATION_PCT from the reference is
+       discarded before spread math (kills the one-overpriced-listing problem).
+    2. Sanity cap: computed spreads above MAX_PLAUSIBLE_SPREAD_PCT are logged
+       as rejected, never alerted — real cross-market spreads are single to
+       low-double digits.
+    3. Liquidity floors: MIN_RECENT_SALES (where sales data exists) and
+       MIN_BUY_ORDER_DEPTH (a lone qty-1 bid is bait, not a market).
+    4. Exact-item matching: market_hash_name (encodes wear + StatTrak™ +
+       Souvenir) plus Doppler/Gamma Doppler PHASE where the API exposes it.
+       Doppler-family items with unknown phase are dropped (phases price wildly
+       differently). Platform StatTrak/Souvenir flags are cross-checked against
+       the name. CSFloat buy orders with float/attribute restrictions are
+       skipped (can't verify our item satisfies them).
+    5. Cash normalization: coin/credit sites (CSGORoll) are converted to cash
+       value and labeled; non-cash platforms never count as a cash exit.
 
-Two opportunity types:
-    - cross-platform : buy listing on A, transfer, fill buy order on B. Needs the
-                       bought item TRADABLE NOW to transfer in time (trade-locked
-                       items can't be delivered before the order may vanish).
-    - same-platform  : a listing priced below the top buy order on the SAME
-                       platform — instantly fillable, no transfer. Rare, sniped
-                       fast, but flagged first when it appears.
+Spread (per item, buy leg A -> sell quote B):
+    net_proceeds = bid_B * (1 - buy_order_fee_B)          [instant]
+                 | lowest_ask_B * (1 - listing_fee_B)      [not-instant]
+    spread_pct   = (net_proceeds - listing_A) / listing_A * 100
+Flagged when MIN_SPREAD_PCT <= spread_pct <= MAX_PLAUSIBLE_SPREAD_PCT.
+
+Cross-platform opportunities require the bought item to be TRADABLE NOW
+(REQUIRE_TRADABLE_NOW) — a trade-locked item can't be transferred in time.
 
 !! VERIFICATION STATUS !!
-    This rewrite was authored without live network access to the three APIs
-    (the sandbox blocks egress to csfloat.com, api.dmarket.com, api.skinport.com).
-    Endpoint shapes below were taken from current public docs where they exist,
-    and every parser is defensive + degrades to "skip this source" on error.
-    Two things specifically MUST be confirmed against a live run with real keys:
-      1. CSFloat's buy-order endpoint is NOT in CSFloat's official Slate docs
-         (docs.csfloat.com only documents listings). The path used here is the
-         community-known internal one. Confirm it works with your key, or set
-         CSFLOAT_BUY_ORDERS_ENABLED=false to drop CSFloat as a sell venue.
-      2. DMarket target (buy-order) fields, price units, trade-lock field, and
-         the buy-order fill fee — see the DMarket section.
-    Run `SCANNER_DRY_RUN=1 python scanner.py` to exercise the whole pipeline on
-    built-in fixtures without touching the network.
-
-Fees (SELLING into a buy order — confirm; the fill fee can differ from the
-normal listing sell fee):
-    - CSFloat: ~2% seller fee.
-    - DMarket: ~5% seller fee (DMarket runs promos/reductions; verify yours).
-    - Skinport 8% is irrelevant here — Skinport is buy-side only now.
+    Written without live network access (sandbox blocks egress to all market
+    APIs). Endpoint shapes follow current public docs where they exist; every
+    parser degrades to "skip this source" on error. MUST be confirmed live:
+      - CSFloat buy-order endpoint (internal, not in official docs) + fields.
+      - DMarket field names, price units (assumed cents), trade-lock field,
+        target fill fee.
+      - Skinport /v1/sales/history field shape (documented, but unverified).
+      - CSGORoll GraphQL query shape (unofficial, entirely best-effort).
+    Offline pipeline test: SCANNER_DRY_RUN=1 MIN_SPREAD_PCT=8 python scanner.py
 """
 
 import os
+import statistics
 import time
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote
 
@@ -79,107 +100,192 @@ def _env_bool(name: str, default: bool) -> bool:
 
 CSFLOAT_API_KEY = os.environ.get("CSFLOAT_API_KEY", "")
 
-# DMarket needs BOTH a public key and an Ed25519 secret key (hex). Every DMarket
-# request is signed. Leave blank to skip DMarket entirely.
+# DMarket needs BOTH a public key and an Ed25519 secret key (hex). Every
+# DMarket request is signed. Leave blank to skip DMarket entirely.
 DMARKET_PUBLIC_KEY = os.environ.get("DMARKET_PUBLIC_KEY", "")
 DMARKET_SECRET_KEY = os.environ.get("DMARKET_SECRET_KEY", "")
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-# Minimum net spread (after fees) to report. Keep a buffer against price
-# movement and other bots beating you to the listing.
+# Report window: at least MIN_SPREAD_PCT, and no more than
+# MAX_PLAUSIBLE_SPREAD_PCT (above that it's almost certainly a data artifact).
 MIN_SPREAD_PCT = float(os.environ.get("MIN_SPREAD_PCT", 15.0))
+MAX_PLAUSIBLE_SPREAD_PCT = float(os.environ.get("MAX_PLAUSIBLE_SPREAD_PCT", 40.0))
 
-# Ignore items below this price — thin/low-value listings are noise and more
-# likely to be stale or gone by the time you act.
+# Discard any individual listing/bid deviating more than this from the item's
+# robust reference price, before any spread math.
+MAX_DEVIATION_PCT = float(os.environ.get("MAX_DEVIATION_PCT", 25.0))
+
+# Ignore items below this price — thin/low-value listings are noise.
 MIN_ITEM_PRICE_USD = float(os.environ.get("MIN_ITEM_PRICE_USD", 5.0))
 
-# CRITICAL FILTER. Only flag cross-platform opps where the item you'd buy is
-# tradable immediately (no active trade lock/hold) — otherwise you can't
-# transfer it to fill the buy order before the order may vanish.
-REQUIRE_TRADABLE_NOW = _env_bool("REQUIRE_TRADABLE_NOW", True)
+# Liquidity floors.
+MIN_RECENT_SALES = int(os.environ.get("MIN_RECENT_SALES", 3))       # sales/7d, where data exists
+MIN_BUY_ORDER_DEPTH = int(os.environ.get("MIN_BUY_ORDER_DEPTH", 2))  # top-bid quantity; qty-1 = bait
 
-# Some feeds don't expose per-listing lock status (e.g. Skinport's aggregate
-# items feed). When lock status is UNKNOWN and REQUIRE_TRADABLE_NOW is on, do we
-# keep the opp (flagged "unknown") or drop it? Default: drop — "unknown" is not
-# "confirmed tradable". Flip to true to keep unknowns (with a warning label).
+# CRITICAL: only flag cross-platform opps where the bought item is tradable
+# immediately — a locked item can't be transferred to fill the order in time.
+REQUIRE_TRADABLE_NOW = _env_bool("REQUIRE_TRADABLE_NOW", True)
+# When a feed doesn't expose lock status (Skinport aggregate, CSGORoll), keep
+# the opp (labeled "unknown") or drop it? Default drop — unknown != tradable.
 TREAT_UNKNOWN_TRADABLE_AS_OK = _env_bool("TREAT_UNKNOWN_TRADABLE_AS_OK", False)
 
-# Optional order-book depth gate. A lone high bid can be cancelled before you
-# deliver; a wall of bids is safer. 0 disables the gate. Only applied when the
-# platform actually reports depth.
-MIN_BUY_ORDER_DEPTH = int(os.environ.get("MIN_BUY_ORDER_DEPTH", 0))
+# Include not-instant (list-and-wait) sell quotes, clearly marked.
+ALLOW_NOT_INSTANT = _env_bool("ALLOW_NOT_INSTANT", True)
 
-# Selling-into-a-buy-order fees (percent). Confirm — the fill fee can differ
-# from the normal listing sell fee.
-CSFLOAT_BUY_ORDER_FEE_PCT = float(os.environ.get("CSFLOAT_BUY_ORDER_FEE_PCT", 2.0))
-DMARKET_BUY_ORDER_FEE_PCT = float(os.environ.get("DMARKET_BUY_ORDER_FEE_PCT", 5.0))
+# Fees (percent). Confirm against your account tier — the buy-order fill fee
+# can differ from the normal listing sale fee.
+BUY_ORDER_FEE_PCT = {
+    "CSFloat": float(os.environ.get("CSFLOAT_BUY_ORDER_FEE_PCT", 2.0)),
+    "DMarket": float(os.environ.get("DMARKET_BUY_ORDER_FEE_PCT", 5.0)),
+}
+LISTING_FEE_PCT = {
+    "Skinport": float(os.environ.get("SKINPORT_SELL_FEE_PCT", 8.0)),  # 6% >= 1000 EUR
+    "CSFloat": float(os.environ.get("CSFLOAT_SELL_FEE_PCT", 2.0)),
+    "DMarket": float(os.environ.get("DMARKET_SELL_FEE_PCT", 5.0)),
+}
 
 # CSFloat buy orders use an endpoint that isn't in CSFloat's official docs.
-# Set false to keep CSFloat as a buy-side (listing) source but not a sell venue.
 CSFLOAT_BUY_ORDERS_ENABLED = _env_bool("CSFLOAT_BUY_ORDERS_ENABLED", True)
 
-# Buy-order lookups are per-item, so they're the expensive calls. Cap how many
-# candidate items we look up per platform to stay well under rate limits.
+# CSGORoll (unofficial, owner-authorized — see module docstring). Off by default.
+CSGOROLL_ENABLED = _env_bool("CSGOROLL_ENABLED", False)
+# Cash value of one CSGORoll coin. Coins can't be withdrawn as money — you exit
+# by withdrawing a skin and reselling it — so their real cash value sits well
+# below 1:1. Set this to YOUR realistic acquisition/exit rate.
+CSGOROLL_COIN_USD = float(os.environ.get("CSGOROLL_COIN_USD", 0.66))
+
+# Buy-order lookups are per-item (the expensive calls) — cap them per platform.
 MAX_BUY_ORDER_LOOKUPS = int(os.environ.get("MAX_BUY_ORDER_LOOKUPS", 60))
 
-# Offline pipeline test with built-in fixtures (no network). See build_mock_data.
+# Offline pipeline test with built-in fixtures (no network).
 DRY_RUN = _env_bool("SCANNER_DRY_RUN", False)
 
-DMARKET_GAME_ID = os.environ.get("DMARKET_GAME_ID", "a8db")  # a8db = CS:GO/CS2 on DMarket
+DMARKET_GAME_ID = os.environ.get("DMARKET_GAME_ID", "a8db")  # a8db = CS:GO/CS2
 DMARKET_BASE = "https://api.dmarket.com"
 
 REQUEST_TIMEOUT = 20
 
 
 # ---------------------------------------------------------------------------
-# Data model
+# Data model + run-wide state
 # ---------------------------------------------------------------------------
-
-# Sell fee per buy-order platform, keyed by the platform label used below.
-SELL_FEE_PCT = {
-    "CSFloat": CSFLOAT_BUY_ORDER_FEE_PCT,
-    "DMarket": DMARKET_BUY_ORDER_FEE_PCT,
-}
-
 
 @dataclass
 class Listing:
-    """Cheapest current listing (the price you'd pay to acquire) on one platform."""
+    """Cheapest current listing per (platform, item) — the price to acquire."""
     platform: str
-    name: str
-    price: float
+    key: str                     # match key: market_hash_name (+ phase suffix)
+    price: float                 # USD cash-equivalent
     url: str
-    # True = tradable now, False = trade-locked/held, None = platform didn't say.
-    tradable: Optional[bool] = None
-    # CSFloat listing id, needed to look up that item's buy-order book.
-    listing_id: Optional[str] = None
+    tradable: Optional[bool] = None   # True/False/None(unknown)
+    listing_id: Optional[str] = None  # CSFloat id, for buy-order lookups
+    cash_equivalent: bool = True      # False for coin/credit-priced sites
 
 
 @dataclass
 class BuyOrder:
-    """Highest active buy order (bid) — the price you'd sell into — on one platform."""
+    """Highest active unconditional buy order (bid) per (platform, item)."""
     platform: str
-    name: str
+    key: str
     price: float
     url: str
-    depth: Optional[int] = None  # quantity behind the top bid, if the API reports it
+    depth: Optional[int] = None  # quantity behind the top bid, if reported
+
+
+@dataclass
+class SellQuote:
+    """An achievable exit: fill a bid (instant) or undercut the lowest ask
+    (not instant). Never derived from any ask above the lowest."""
+    platform: str
+    gross: float
+    net: float
+    url: str
+    instant: bool
+    depth: Optional[int] = None
 
 
 @dataclass
 class Opportunity:
-    item_name: str
+    item_key: str
     buy_platform: str
     buy_price: float
     buy_url: str
-    sell_platform: str
-    buy_order_price: float          # gross top bid you'd fill
-    sell_after_fee: float           # net proceeds after the fill fee
-    sell_url: str
+    sell: SellQuote
     spread_pct: float
-    kind: str                       # "same-platform" | "cross-platform"
+    kind: str                    # "same-platform" | "cross-platform"
     tradable_now: Optional[bool] = None
-    depth: Optional[int] = None
+    reference: Optional[float] = None
+    coin_note: str = ""          # set when the buy leg is coin-denominated
+
+
+# Run-wide accumulators (reset in main()).
+REJECTIONS = Counter()
+REJECT_SAMPLES = defaultdict(list)
+REF_INPUTS = defaultdict(list)   # key -> [candidate reference prices]
+SALES_7D = {}                    # market_hash_name -> sales volume last 7 days
+
+REJECT_REASONS = (
+    "outlier_listing", "outlier_bid", "implausible_spread", "thin_depth",
+    "low_sales", "trade_locked", "tradable_unknown", "phase_unknown",
+    "condition_mismatch", "conditional_order",
+)
+
+
+def reject(reason: str, key: str = "", detail: str = ""):
+    REJECTIONS[reason] += 1
+    if key and len(REJECT_SAMPLES[reason]) < 3:
+        REJECT_SAMPLES[reason].append(f"{key}{f' ({detail})' if detail else ''}")
+
+
+def reference_price(key: str) -> Optional[float]:
+    vals = REF_INPUTS.get(key)
+    return statistics.median(vals) if vals else None
+
+
+def deviates(price: float, ref: Optional[float]) -> bool:
+    if not ref or ref <= 0:
+        return False  # no reference -> can't judge, don't reject on this axis
+    return abs(price - ref) / ref * 100 > MAX_DEVIATION_PCT
+
+
+def base_name(key: str) -> str:
+    return key.split(" · ")[0]
+
+
+def make_match_key(name: str, phase: Optional[str]) -> Optional[str]:
+    """Match items exactly. market_hash_name already encodes wear, StatTrak™
+    and Souvenir. Doppler/Gamma Doppler phases share one name but price wildly
+    differently — phase becomes part of the key; unknown phase = unmatchable."""
+    if phase:
+        return f"{name} · {phase}"
+    if "Doppler" in name:  # covers Gamma Doppler too
+        return None
+    return name
+
+
+def ingest_listing(store: dict, platform: str, name: str, price: float, url: str,
+                   tradable: Optional[bool] = None, listing_id: Optional[str] = None,
+                   phase: Optional[str] = None, is_stattrak: Optional[bool] = None,
+                   is_souvenir: Optional[bool] = None, cash_equivalent: bool = True,
+                   ref_input: Optional[float] = None):
+    """Shared ingestion for real fetchers AND dry-run fixtures, so condition
+    checks and rejection counters behave identically in both."""
+    if is_stattrak is not None and is_stattrak != ("StatTrak™" in name):
+        reject("condition_mismatch", name, "StatTrak flag vs name")
+        return
+    if is_souvenir is not None and is_souvenir != ("Souvenir" in name):
+        reject("condition_mismatch", name, "Souvenir flag vs name")
+        return
+    key = make_match_key(name, phase)
+    if key is None:
+        reject("phase_unknown", name)
+        return
+    if ref_input:
+        REF_INPUTS[key].append(float(ref_input))
+    if key not in store or price < store[key].price:
+        store[key] = Listing(platform, key, price, url, tradable=tradable,
+                             listing_id=listing_id, cash_equivalent=cash_equivalent)
 
 
 # ---------------------------------------------------------------------------
@@ -187,37 +293,56 @@ class Opportunity:
 # ---------------------------------------------------------------------------
 
 def fetch_skinport_listings() -> dict:
-    """
-    {name: Listing} from Skinport's public, no-auth items feed (lowest listing
-    per item). NOTE: this aggregate feed exposes no per-listing trade-lock info,
-    so tradable stays None (unknown) — which, by default, filters Skinport out
-    of cross-platform opps under REQUIRE_TRADABLE_NOW. That's intentional: we
-    can't confirm the item is transferable in time.
-    Docs: https://docs.skinport.com/  Rate limit: ~8 req / 5 min, cached ~5 min.
-    """
+    """{key: Listing} from Skinport's public items feed (lowest ask per item).
+    No per-listing lock info -> tradable None. median_price feeds the reference.
+    Doppler-family items are dropped (feed can't distinguish phases).
+    Docs: https://docs.skinport.com/  Rate limit ~8 req/5min, cached ~5 min."""
     url = "https://api.skinport.com/v1/items"
-    params = {"app_id": 730, "currency": "USD"}  # 730 = CS2/CS:GO
+    params = {"app_id": 730, "currency": "USD"}
     headers = {"Accept-Encoding": "br"}  # Brotli required per Skinport docs
     resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
-    data = resp.json()
 
-    listings = {}
-    for item in data:
+    store = {}
+    for item in resp.json():
         name = item.get("market_hash_name")
         price = item.get("min_price")
-        if name and price:
-            item_url = item.get("item_page") or ("https://skinport.com/market?search=" + quote(name))
-            listings[name] = Listing("Skinport", name, float(price), item_url, tradable=None)
-    return listings
+        if not (name and price):
+            continue
+        page = item.get("item_page") or ("https://skinport.com/market?search=" + quote(name))
+        ref = item.get("median_price") or item.get("suggested_price") or item.get("mean_price")
+        ingest_listing(store, "Skinport", name, float(price), page,
+                       tradable=None, ref_input=float(ref) if ref else None)
+    return store
+
+
+def fetch_skinport_sales() -> None:
+    """Populate SALES_7D and reference inputs from Skinport's aggregated sales
+    history (completed sales — the preferred reference per item).
+    Docs: https://docs.skinport.com/sales/history  UNVERIFIED field shape."""
+    url = "https://api.skinport.com/v1/sales/history"
+    params = {"app_id": 730, "currency": "USD"}
+    headers = {"Accept-Encoding": "br"}
+    resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    for row in resp.json():
+        name = row.get("market_hash_name")
+        week = row.get("last_7_days") or {}
+        if not name or not isinstance(week, dict):
+            continue
+        vol = week.get("volume")
+        if isinstance(vol, (int, float)):
+            SALES_7D[name] = int(vol)
+        median = week.get("median")
+        if median and make_match_key(name, None):
+            REF_INPUTS[name].append(float(median))
 
 
 def fetch_csfloat_listings() -> dict:
-    """
-    {name: Listing} from CSFloat's listings endpoint, lowest price per item.
-    Captures the listing id (for buy-order lookups) and the `tradable` field.
-    Docs: https://docs.csfloat.com/  Auth: `Authorization: <key>`. Prices in cents.
-    """
+    """{key: Listing} from CSFloat's listings endpoint (lowest per item).
+    Captures listing id (for buy-order lookups), tradable, Doppler phase, and
+    the platform's predicted price as a reference input.
+    Docs: https://docs.csfloat.com/  Auth: `Authorization: <key>`. Cents."""
     if not CSFLOAT_API_KEY:
         return {}
 
@@ -225,15 +350,15 @@ def fetch_csfloat_listings() -> dict:
     headers = {"Authorization": CSFLOAT_API_KEY}
     params = {
         "sort_by": "lowest_price",
-        "limit": 50,  # docs: max 50
-        "min_price": int(MIN_ITEM_PRICE_USD * 100),  # cents; keeps penny listings out of the sort
+        "limit": 50,
+        "min_price": int(MIN_ITEM_PRICE_USD * 100),
     }
 
-    listings = {}
+    store = {}
     cursor = None
     retries_429 = 0
-    pages_fetched = 0
-    while pages_fetched < 10:  # a handful of pages is enough coverage
+    pages = 0
+    while pages < 10:
         if cursor:
             params["cursor"] = cursor
         resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
@@ -247,41 +372,37 @@ def fetch_csfloat_listings() -> dict:
         retries_429 = 0
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, dict):
-            rows = data.get("data", [])
-            cursor = data.get("cursor")
-        else:
-            rows, cursor = data, None
+        rows = data.get("data", []) if isinstance(data, dict) else data
+        cursor = data.get("cursor") if isinstance(data, dict) else None
         if not rows:
             break
-
         for row in rows:
             item = row.get("item", {})
             name = item.get("market_hash_name")
             price_cents = row.get("price")
-            listing_id = row.get("id")
             if not (name and price_cents):
                 continue
-            price = price_cents / 100.0
-            tradable = _csfloat_tradable(item)
-            if name not in listings or price < listings[name].price:
-                listings[name] = Listing(
-                    "CSFloat", name, price,
-                    f"https://csfloat.com/item/{listing_id}",
-                    tradable=tradable, listing_id=listing_id,
-                )
-        pages_fetched += 1
+            reference = row.get("reference") or {}
+            ref_cents = reference.get("predicted_price") or reference.get("base_price")
+            ingest_listing(
+                store, "CSFloat", name, price_cents / 100.0,
+                f"https://csfloat.com/item/{row.get('id')}",
+                tradable=_csfloat_tradable(item), listing_id=row.get("id"),
+                phase=item.get("phase"),
+                is_stattrak=item.get("is_stattrak"), is_souvenir=item.get("is_souvenir"),
+                ref_input=ref_cents / 100.0 if ref_cents else None,
+            )
+        pages += 1
         if not cursor:
             break
-    return listings
+    return store
 
 
 def _csfloat_tradable(item: dict) -> Optional[bool]:
-    """Interpret CSFloat's trade-lock signal. UNVERIFIED field semantics — CSFloat
-    exposes `tradable` and may expose a lock-expiry timestamp. Treat a future
-    lock expiry as locked; otherwise fall back to the `tradable` flag."""
-    for key in ("tradable_at", "trade_lock_until", "lock_expires_at"):
-        ts = item.get(key)
+    """UNVERIFIED semantics: a future lock-expiry timestamp means locked;
+    otherwise fall back to the `tradable` flag."""
+    for k in ("tradable_at", "trade_lock_until", "lock_expires_at"):
+        ts = item.get(k)
         if isinstance(ts, (int, float)) and ts > time.time():
             return False
     if "tradable" in item:
@@ -290,23 +411,18 @@ def _csfloat_tradable(item: dict) -> Optional[bool]:
 
 
 def fetch_dmarket_listings() -> dict:
-    """
-    {name: Listing} from DMarket's market items (lowest offer per title).
-    Signed request. Prices assumed in cents (USD). Trade-lock parsed defensively.
-    Endpoint: GET /exchange/v1/market/items?gameId=<id>&orderBy=price&orderDir=asc
-    UNVERIFIED against a live run — see module header.
-    """
+    """{key: Listing} from DMarket market items (lowest offer per title), signed.
+    Every observed ask feeds the reference (median of low asks = fallback ref).
+    Endpoint: GET /exchange/v1/market/items — UNVERIFIED, prices assumed cents."""
     if not (DMARKET_PUBLIC_KEY and DMARKET_SECRET_KEY):
         return {}
 
-    listings = {}
+    store = {}
     cursor = None
     pages = 0
     while pages < 10:
-        q = (
-            f"/exchange/v1/market/items?gameId={DMARKET_GAME_ID}"
-            f"&currency=USD&limit=100&orderBy=price&orderDir=asc"
-        )
+        q = (f"/exchange/v1/market/items?gameId={DMARKET_GAME_ID}"
+             f"&currency=USD&limit=100&orderBy=price&orderDir=asc")
         if cursor:
             q += f"&cursor={quote(cursor)}"
         data = _dmarket_signed_get(q)
@@ -321,22 +437,22 @@ def fetch_dmarket_listings() -> dict:
             price = _dmarket_money_to_usd(obj.get("price"))
             if not (name and price):
                 continue
-            tradable = _dmarket_tradable(obj)
-            item_id = obj.get("itemId") or obj.get("classId") or ""
+            extra = obj.get("extra") or {}
             url = f"https://dmarket.com/ingame-items/item-list/csgo-skins?title={quote(name)}"
-            if name not in listings or price < listings[name].price:
-                listings[name] = Listing("DMarket", name, price, url, tradable=tradable)
+            ingest_listing(store, "DMarket", name, price, url,
+                           tradable=_dmarket_tradable(obj), phase=extra.get("phase"),
+                           ref_input=price)
         pages += 1
         if not cursor:
             break
-    return listings
+    return store
 
 
 def _dmarket_tradable(obj: dict) -> Optional[bool]:
-    """UNVERIFIED. DMarket exposes trade-lock via `extra`; try the common shapes."""
+    """UNVERIFIED. DMarket exposes lock info via `extra`; try common shapes."""
     extra = obj.get("extra") or {}
-    for key in ("tradeLockDuration", "tradeLock", "lockDuration"):
-        v = extra.get(key)
+    for k in ("tradeLockDuration", "tradeLock", "lockDuration"):
+        v = extra.get(k)
         if isinstance(v, (int, float)):
             return v <= 0
     if "tradable" in extra:
@@ -347,31 +463,76 @@ def _dmarket_tradable(obj: dict) -> Optional[bool]:
     return None
 
 
+def fetch_csgoroll_listings() -> dict:
+    """{key: Listing} from CSGORoll's UNOFFICIAL GraphQL endpoint (the one the
+    site's own web client uses). CSGORoll publishes no official API; the owner
+    explicitly authorized this read-only scrape. Guardrails: plain request, no
+    UA spoofing, no proxies, no retries against blocks — a 4xx/403 means skip.
+    Prices are COINS -> converted via CSGOROLL_COIN_USD and marked
+    cash_equivalent=False (never a sell venue; coins aren't withdrawable cash).
+    ENTIRELY UNVERIFIED — expect to adjust the query/fields on first live run."""
+    if not CSGOROLL_ENABLED:
+        return {}
+    url = "https://api.csgoroll.com/graphql"
+    query = {
+        "operationName": "TradeList",
+        "query": (
+            "query TradeList($first: Int, $status: [TradeStatus!]) {"
+            " trades(first: $first, status: $status) {"
+            " edges { node { id totalValue tradeItems { marketName value } } } } }"
+        ),
+        "variables": {"first": 100, "status": ["LISTED"]},
+    }
+    try:
+        resp = requests.post(url, json=query, timeout=REQUEST_TIMEOUT)
+        if resp.status_code in (401, 403, 429):
+            print(f"  CSGORoll returned {resp.status_code} — skipping (no retry/evasion).")
+            return {}
+        resp.raise_for_status()
+        payload = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        print(f"  CSGORoll request failed ({e.__class__.__name__}) — skipping.")
+        return {}
+
+    store = {}
+    edges = (((payload.get("data") or {}).get("trades") or {}).get("edges")) or []
+    for edge in edges:
+        node = edge.get("node") or {}
+        for it in node.get("tradeItems") or []:
+            name = it.get("marketName")
+            coins = it.get("value")
+            if not (name and isinstance(coins, (int, float))):
+                continue
+            ingest_listing(
+                store, "CSGORoll", name, float(coins) * CSGOROLL_COIN_USD,
+                "https://www.csgoroll.com/en/withdraw/csgo",
+                tradable=None, cash_equivalent=False,
+            )
+    return store
+
+
 # ---------------------------------------------------------------------------
 # Sell-side buy-order fetchers
 # ---------------------------------------------------------------------------
 
 def fetch_csfloat_buy_orders(listings: dict, candidates: list) -> dict:
-    """
-    {name: BuyOrder} — highest active CSFloat buy order per candidate item.
-
-    !! Uses CSFloat's internal buy-order endpoint, which is NOT in the official
-    Slate docs (community-known). Per-listing, so we only look up items we found
-    a CSFloat listing for, capped at MAX_BUY_ORDER_LOOKUPS. Disable via
-    CSFLOAT_BUY_ORDERS_ENABLED=false. UNVERIFIED — confirm response shape.
-    """
+    """{key: BuyOrder} — highest UNCONDITIONAL CSFloat buy order per candidate.
+    Uses CSFloat's internal buy-order endpoint (NOT in official docs) —
+    per-listing, capped at MAX_BUY_ORDER_LOOKUPS. Orders carrying float/attribute
+    restrictions are skipped: we can't verify our item satisfies them, and a
+    restricted bid our item can't fill is exactly how fake spreads happen."""
     if not (CSFLOAT_API_KEY and CSFLOAT_BUY_ORDERS_ENABLED):
         return {}
 
     headers = {"Authorization": CSFLOAT_API_KEY}
     orders = {}
     looked_up = 0
-    for name in candidates:
+    for key in candidates:
         if looked_up >= MAX_BUY_ORDER_LOOKUPS:
             break
-        listing = listings.get(name)
+        listing = listings.get(key)
         if not listing or not listing.listing_id:
-            continue  # need a listing id to query that item's book
+            continue
         looked_up += 1
         url = f"https://csfloat.com/api/v1/listings/{listing.listing_id}/buy-orders"
         try:
@@ -384,34 +545,43 @@ def fetch_csfloat_buy_orders(listings: dict, candidates: list) -> dict:
         except (requests.RequestException, ValueError):
             continue
         rows = body.get("data", []) if isinstance(body, dict) else body
-        top = _highest_buy_order(rows, price_key="price", qty_key="qty")
-        if top:
-            price_cents, depth = top
-            orders[name] = BuyOrder(
-                "CSFloat", name, price_cents / 100.0,
-                url=listing.url, depth=depth,
-            )
+        best = None
+        for r in rows if isinstance(rows, list) else []:
+            if not isinstance(r, dict):
+                continue
+            # Conditional/attribute-restricted order (e.g. float band): skip.
+            if r.get("expression") or r.get("min_float") or r.get("max_float"):
+                reject("conditional_order", key)
+                continue
+            price = r.get("price")
+            if not isinstance(price, (int, float)):
+                continue
+            if best is None or price > best[0]:
+                qty = r.get("qty")
+                best = (price, int(qty) if isinstance(qty, (int, float)) else None)
+        if best:
+            orders[key] = BuyOrder("CSFloat", key, best[0] / 100.0, listing.url, depth=best[1])
     return orders
 
 
 def fetch_dmarket_buy_orders(candidates: list) -> dict:
-    """
-    {name: BuyOrder} — highest active DMarket target (buy order) per candidate.
-    Endpoint: GET /marketplace-api/v1/targets-by-title/<gameId>/<title>
-    Returns orders with `amount` (depth) and `price`. Signed request.
-    UNVERIFIED against a live run — see module header.
-    """
+    """{key: BuyOrder} — highest DMarket target per candidate, with `amount` as
+    depth. Endpoint: GET /marketplace-api/v1/targets-by-title/<gameId>/<title>
+    (signed). UNVERIFIED. NOTE: title lookups can't carry Doppler phase, so
+    phase-keyed candidates are looked up by base name; DMarket targets may or
+    may not be phase-specific — treat Doppler fills there with extra care."""
     if not (DMARKET_PUBLIC_KEY and DMARKET_SECRET_KEY):
         return {}
 
     orders = {}
     looked_up = 0
-    for name in candidates:
+    for key in candidates:
         if looked_up >= MAX_BUY_ORDER_LOOKUPS:
             break
         looked_up += 1
-        q = f"/marketplace-api/v1/targets-by-title/{DMARKET_GAME_ID}/{quote(name)}"
-        data = _dmarket_signed_get(q)
+        title = base_name(key)
+        data = _dmarket_signed_get(
+            f"/marketplace-api/v1/targets-by-title/{DMARKET_GAME_ID}/{quote(title)}")
         if not data:
             continue
         rows = data.get("orders", []) if isinstance(data, dict) else []
@@ -424,28 +594,10 @@ def fetch_dmarket_buy_orders(candidates: list) -> dict:
                 best_price = price
                 best_depth = row.get("amount")
         if best_price is not None:
-            url = f"https://dmarket.com/ingame-items/item-list/csgo-skins?title={quote(name)}"
+            url = f"https://dmarket.com/ingame-items/item-list/csgo-skins?title={quote(title)}"
             depth = int(best_depth) if isinstance(best_depth, (int, float)) else None
-            orders[name] = BuyOrder("DMarket", name, best_price, url=url, depth=depth)
+            orders[key] = BuyOrder("DMarket", key, best_price, url, depth=depth)
     return orders
-
-
-def _highest_buy_order(rows, price_key="price", qty_key="qty"):
-    """From a list of buy-order dicts (prices in cents), return (top_price_cents,
-    depth_at_top) or None. Highest price wins."""
-    if not isinstance(rows, list):
-        return None
-    best = None
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        price = r.get(price_key)
-        if not isinstance(price, (int, float)):
-            continue
-        if best is None or price > best[0]:
-            qty = r.get(qty_key)
-            best = (price, int(qty) if isinstance(qty, (int, float)) else None)
-    return best
 
 
 # ---------------------------------------------------------------------------
@@ -453,18 +605,13 @@ def _highest_buy_order(rows, price_key="price", qty_key="qty"):
 # ---------------------------------------------------------------------------
 
 def _dmarket_signed_get(path_with_query: str):
-    """Signed GET against DMarket. Returns parsed JSON, or None on any failure
-    (missing crypto lib, network error, non-200, bad JSON) so one bad source
-    never takes the whole scan down.
-
-    Signing (per DMarket docs): sign the string
-        method + path_with_query + body + timestamp
-    with Ed25519 using the hex secret key; send:
-        X-Api-Key, X-Request-Sign: "dmar ed25519 <hexsig>", X-Sign-Date: <ts>
-    """
+    """Signed GET against DMarket. Returns parsed JSON or None on any failure,
+    so one bad source never takes the whole scan down.
+    Signs method+path+body+timestamp with Ed25519 (hex secret key); headers:
+    X-Api-Key, X-Request-Sign: "dmar ed25519 <hexsig>", X-Sign-Date."""
     try:
-        from nacl.signing import SigningKey
         from nacl.encoding import HexEncoder
+        from nacl.signing import SigningKey
     except ImportError:
         print("  DMarket skipped: PyNaCl not installed (pip install PyNaCl).")
         return None
@@ -491,15 +638,11 @@ def _dmarket_signed_get(path_with_query: str):
 
 
 def _dmarket_money_to_usd(money) -> Optional[float]:
-    """DMarket money -> USD float. Amounts are in cents. Accepts {'USD': '1234'},
-    {'amount': '1234', 'currency': 'USD'}, or a bare number. UNVERIFIED units."""
+    """DMarket money -> USD float. Cents assumed. Accepts {'USD': '1234'},
+    {'amount': '1234'}, or a bare number. UNVERIFIED units."""
     if money is None:
         return None
-    raw = None
-    if isinstance(money, dict):
-        raw = money.get("USD", money.get("amount"))
-    elif isinstance(money, (int, float, str)):
-        raw = money
+    raw = money.get("USD", money.get("amount")) if isinstance(money, dict) else money
     try:
         return float(raw) / 100.0 if raw is not None else None
     except (TypeError, ValueError):
@@ -507,65 +650,102 @@ def _dmarket_money_to_usd(money) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# Core: pair listings against buy orders
+# Core: pair buy legs against achievable sell quotes
 # ---------------------------------------------------------------------------
 
 def find_opportunities(listings_by_platform: dict, orders_by_platform: dict) -> list:
-    """listings_by_platform: {platform: {name: Listing}}
-       orders_by_platform:   {platform: {name: BuyOrder}}
-    Pairs every listing (buy) against every buy order (sell) for the same item."""
-    # Reindex by item name.
-    listings_by_name = {}
+    """listings_by_platform: {platform: {key: Listing}}
+       orders_by_platform:   {platform: {key: BuyOrder}}"""
+    listings_by_key = defaultdict(dict)
     for plat, d in listings_by_platform.items():
-        for name, lst in d.items():
-            listings_by_name.setdefault(name, {})[plat] = lst
-    orders_by_name = {}
+        for key, lst in d.items():
+            listings_by_key[key][plat] = lst
+    orders_by_key = defaultdict(dict)
     for plat, d in orders_by_platform.items():
-        for name, order in d.items():
-            orders_by_name.setdefault(name, {})[plat] = order
+        for key, order in d.items():
+            orders_by_key[key][plat] = order
 
     opportunities = []
-    for name in set(listings_by_name) & set(orders_by_name):
-        for buy_plat, listing in listings_by_name[name].items():
-            if listing.price < MIN_ITEM_PRICE_USD:
+    for key, buy_side in listings_by_key.items():
+        # Liquidity floor: recent sales volume, where the data exists.
+        vol = SALES_7D.get(base_name(key))
+        if vol is not None and MIN_RECENT_SALES and vol < MIN_RECENT_SALES:
+            reject("low_sales", key, f"{vol} sales/7d")
+            continue
+
+        ref = reference_price(key)
+
+        # Build achievable sell quotes. INSTANT: surviving top bids.
+        quotes = []
+        for plat, order in orders_by_key.get(key, {}).items():
+            if deviates(order.price, ref):
+                reject("outlier_bid", key, f"bid ${order.price:.2f} vs ref ${ref:.2f}")
                 continue
-            for sell_plat, order in orders_by_name[name].items():
-                fee = SELL_FEE_PCT.get(sell_plat, 0.0)
-                net = order.price * (1 - fee / 100.0)
-                spread = (net - listing.price) / listing.price * 100 if listing.price > 0 else 0
+            if MIN_BUY_ORDER_DEPTH and order.depth is not None and order.depth < MIN_BUY_ORDER_DEPTH:
+                reject("thin_depth", key, f"depth {order.depth}")
+                continue
+            net = order.price * (1 - BUY_ORDER_FEE_PCT.get(plat, 0.0) / 100.0)
+            quotes.append(SellQuote(plat, order.price, net, order.url, True, order.depth))
+
+        # NOT-INSTANT: lowest ask on platforms without a surviving bid. We'd
+        # have to match/undercut it and wait — proceeds are an upper bound.
+        if ALLOW_NOT_INSTANT:
+            instant_plats = {q.platform for q in quotes}
+            for plat, lst in buy_side.items():
+                if plat in instant_plats or plat not in LISTING_FEE_PCT:
+                    continue
+                if not lst.cash_equivalent:
+                    continue  # coin site: not a cash exit
+                if deviates(lst.price, ref):
+                    continue  # counted as outlier_listing when it's a buy leg
+                net = lst.price * (1 - LISTING_FEE_PCT[plat] / 100.0)
+                quotes.append(SellQuote(plat, lst.price, net, lst.url, False))
+        if not quotes:
+            continue
+
+        for buy_plat, lst in buy_side.items():
+            if lst.price < MIN_ITEM_PRICE_USD:
+                continue
+            if deviates(lst.price, ref):
+                reject("outlier_listing", key, f"ask ${lst.price:.2f} vs ref ${ref:.2f}")
+                continue
+            for q in quotes:
+                same = (q.platform == buy_plat)
+                if same and not q.instant:
+                    continue  # relisting on the same platform is not an opportunity
+                spread = (q.net - lst.price) / lst.price * 100 if lst.price > 0 else 0
                 if spread < MIN_SPREAD_PCT:
                     continue
-
-                # Depth gate (only when depth is known).
-                if MIN_BUY_ORDER_DEPTH and order.depth is not None and order.depth < MIN_BUY_ORDER_DEPTH:
+                if spread > MAX_PLAUSIBLE_SPREAD_PCT:
+                    reject("implausible_spread", key, f"{spread:.0f}%")
                     continue
-
-                same_platform = (buy_plat == sell_plat)
-
-                # Tradable-now gate applies to cross-platform (needs a transfer).
-                if not same_platform and REQUIRE_TRADABLE_NOW:
-                    if listing.tradable is False:
+                if not same and REQUIRE_TRADABLE_NOW:
+                    if lst.tradable is False:
+                        reject("trade_locked", key)
                         continue
-                    if listing.tradable is None and not TREAT_UNKNOWN_TRADABLE_AS_OK:
+                    if lst.tradable is None and not TREAT_UNKNOWN_TRADABLE_AS_OK:
+                        reject("tradable_unknown", key)
                         continue
-
                 opportunities.append(Opportunity(
-                    item_name=name,
+                    item_key=key,
                     buy_platform=buy_plat,
-                    buy_price=listing.price,
-                    buy_url=listing.url,
-                    sell_platform=sell_plat,
-                    buy_order_price=order.price,
-                    sell_after_fee=net,
-                    sell_url=order.url,
+                    buy_price=lst.price,
+                    buy_url=lst.url,
+                    sell=q,
                     spread_pct=spread,
-                    kind="same-platform" if same_platform else "cross-platform",
-                    tradable_now=listing.tradable,
-                    depth=order.depth,
+                    kind="same-platform" if same else "cross-platform",
+                    tradable_now=lst.tradable,
+                    reference=ref,
+                    coin_note=("" if lst.cash_equivalent else
+                               f"buy leg is COIN-priced (converted @ {CSGOROLL_COIN_USD}/coin) — not cash-equivalent"),
                 ))
 
-    # Same-platform (fastest, no transfer) first, then cross-platform by spread.
-    opportunities.sort(key=lambda o: (0 if o.kind == "same-platform" else 1, -o.spread_pct))
+    # Instant same-platform (fastest) first, then instant cross, then
+    # not-instant; by spread within each group.
+    def sort_key(o):
+        group = 0 if (o.sell.instant and o.kind == "same-platform") else (1 if o.sell.instant else 2)
+        return (group, -o.spread_pct)
+    opportunities.sort(key=sort_key)
     return opportunities
 
 
@@ -575,10 +755,8 @@ def find_opportunities(listings_by_platform: dict, orders_by_platform: dict) -> 
 
 def _tradable_label(o: Opportunity) -> str:
     if o.kind == "same-platform":
-        # No cross-platform transfer, but a trade lock still delays delivery
-        # into the buy order, so surface it when the platform told us.
         if o.tradable_now is False:
-            return "same-platform (no transfer) — but item is trade-LOCKED, delivery delayed"
+            return "same-platform — but item is trade-LOCKED, delivery delayed"
         return "same-platform (no transfer)"
     if o.tradable_now is True:
         return "tradable now: yes"
@@ -587,20 +765,35 @@ def _tradable_label(o: Opportunity) -> str:
     return "tradable now: unknown"
 
 
-def _depth_label(o: Opportunity) -> str:
-    return f", depth {o.depth}" if o.depth is not None else ""
-
-
 def format_opportunity(o: Opportunity) -> str:
+    speed = "INSTANT" if o.sell.instant else "NOT INSTANT — needs a buyer"
     tag = "SAME-PLATFORM MISPRICING" if o.kind == "same-platform" else "cross-platform"
-    warn = "⚠️ " if o.tradable_now is False or (o.kind == "cross-platform" and o.tradable_now is not True) else ""
-    return (
-        f"[{tag}] {o.item_name} — {o.spread_pct:.1f}% net\n"
-        f"Buy:  {o.buy_platform} @ ${o.buy_price:.2f} — {o.buy_url}\n"
-        f"Sell into buy order: {o.sell_platform} @ ${o.buy_order_price:.2f} "
-        f"(top bid{_depth_label(o)}) → net ${o.sell_after_fee:.2f} after fee — {o.sell_url}\n"
-        f"{warn}{_tradable_label(o)}"
-    )
+    depth = f", depth {o.sell.depth}" if o.sell.depth is not None else ""
+    mech = (f"fill top buy order ${o.sell.gross:.2f}{depth}" if o.sell.instant
+            else f"undercut lowest ask ${o.sell.gross:.2f} and wait")
+    ref = f" | ref ${o.reference:.2f}" if o.reference else ""
+    warn = "⚠️ " if (o.tradable_now is False or
+                     (o.kind == "cross-platform" and o.tradable_now is None)) else ""
+    lines = [
+        f"[{tag} | {speed}] {base_name(o.item_key)}"
+        + (f" ({o.item_key.split(' · ')[1]})" if " · " in o.item_key else "")
+        + f" — {o.spread_pct:.1f}% net{ref}",
+        f"Buy:  {o.buy_platform} @ ${o.buy_price:.2f} — {o.buy_url}",
+        f"Sell: {o.sell.platform} — {mech} → net ${o.sell.net:.2f} after fee — {o.sell.url}",
+        f"{warn}{_tradable_label(o)}",
+    ]
+    if o.coin_note:
+        lines.append(f"⚠️ {o.coin_note}")
+    return "\n".join(lines)
+
+
+def print_rejection_summary(n_accepted: int):
+    print("\n--- Filter summary ---")
+    print(f"accepted: {n_accepted}")
+    for reason in REJECT_REASONS:
+        n = REJECTIONS.get(reason, 0)
+        samples = f"  e.g. {'; '.join(REJECT_SAMPLES[reason])}" if n else ""
+        print(f"rejected {reason:<20} {n}{samples}")
 
 
 def send_discord_alert(opportunities: list):
@@ -609,7 +802,7 @@ def send_discord_alert(opportunities: list):
     if not DISCORD_WEBHOOK_URL:
         print("No DISCORD_WEBHOOK_URL set — console only.")
         return
-    lines = ["**CS2 Arbitrage — sell-into-buy-order opportunities:**\n"]
+    lines = ["**CS2 Arbitrage — achievable-exit opportunities:**\n"]
     for o in opportunities[:15]:
         lines.append(format_opportunity(o) + "\n")
     content = "\n".join(lines)
@@ -623,13 +816,14 @@ def send_discord_alert(opportunities: list):
 # ---------------------------------------------------------------------------
 
 def gather() -> tuple:
-    """Fetch listings and buy orders from every enabled source. Each source is
-    isolated: if one raises, we log and continue with the rest."""
+    """Fetch listings, sales references, and buy orders from every enabled
+    source. Sources are isolated: one failure skips that source only."""
     listings_by_platform = {}
     for label, fn in (
         ("Skinport", fetch_skinport_listings),
         ("CSFloat", fetch_csfloat_listings),
         ("DMarket", fetch_dmarket_listings),
+        ("CSGORoll", fetch_csgoroll_listings),
     ):
         try:
             d = fn()
@@ -639,14 +833,18 @@ def gather() -> tuple:
         except requests.RequestException as e:
             print(f"  {label} listings failed ({e.__class__.__name__}) — skipping.")
 
-    # Candidate items = anything we could buy at/above the price floor. We only
-    # look up buy orders for these, which bounds the per-item calls.
-    candidates = set()
-    for d in listings_by_platform.values():
-        for name, lst in d.items():
-            if lst.price >= MIN_ITEM_PRICE_USD:
-                candidates.add(name)
-    candidates = sorted(candidates)
+    try:
+        fetch_skinport_sales()
+        print(f"  Skinport sales history: {len(SALES_7D)} items")
+    except requests.RequestException as e:
+        print(f"  Skinport sales history failed ({e.__class__.__name__}) — references degrade.")
+
+    candidates = sorted({
+        key
+        for d in listings_by_platform.values()
+        for key, lst in d.items()
+        if lst.price >= MIN_ITEM_PRICE_USD
+    })
 
     orders_by_platform = {}
     csfloat_orders = fetch_csfloat_buy_orders(listings_by_platform.get("CSFloat", {}), candidates)
@@ -662,30 +860,31 @@ def gather() -> tuple:
 
 
 def main():
+    REJECTIONS.clear()
+    REJECT_SAMPLES.clear()
+    REF_INPUTS.clear()
+    SALES_7D.clear()
+
     if DRY_RUN:
         print("DRY RUN — using built-in fixtures, no network calls.\n")
         listings_by_platform, orders_by_platform = build_mock_data()
     else:
-        print("Fetching listings (buy side) and buy orders (sell side)...")
+        print("Fetching listings (buy side), sales references, buy orders (sell side)...")
         listings_by_platform, orders_by_platform = gather()
 
-    if not orders_by_platform:
-        print("\nNo buy-order source returned data — nothing to sell into. "
-              "Check CSFloat/DMarket keys, or run with SCANNER_DRY_RUN=1.")
-        return
-
     opportunities = find_opportunities(listings_by_platform, orders_by_platform)
-    if not opportunities:
-        print(f"\nNo opportunities above {MIN_SPREAD_PCT}% net spread this run.")
-        return
 
-    same = [o for o in opportunities if o.kind == "same-platform"]
-    cross = [o for o in opportunities if o.kind == "cross-platform"]
-    print(f"\nFound {len(opportunities)} opportunities "
-          f"({len(same)} same-platform, {len(cross)} cross-platform):\n")
-    for o in opportunities[:15]:
-        print(format_opportunity(o) + "\n")
+    if opportunities:
+        same = sum(1 for o in opportunities if o.kind == "same-platform")
+        instant = sum(1 for o in opportunities if o.sell.instant)
+        print(f"\nFound {len(opportunities)} opportunities "
+              f"({same} same-platform, {instant} instant):\n")
+        for o in opportunities[:15]:
+            print(format_opportunity(o) + "\n")
+    else:
+        print(f"\nNo opportunities in the {MIN_SPREAD_PCT}–{MAX_PLAUSIBLE_SPREAD_PCT}% window this run.")
 
+    print_rejection_summary(len(opportunities))
     send_discord_alert(opportunities)
 
 
@@ -694,39 +893,110 @@ def main():
 # ---------------------------------------------------------------------------
 
 def build_mock_data() -> tuple:
-    """Synthetic data exercising every branch: same-platform mispricing,
-    cross-platform tradable, cross-platform locked (filtered), unknown-tradable
-    (filtered by default), and a depth-gated case."""
-    listings_by_platform = {
-        "Skinport": {
-            # unknown tradable (Skinport feed) -> dropped from cross by default
-            "AK-47 | Redline (Field-Tested)": Listing("Skinport", "AK-47 | Redline (Field-Tested)", 20.00, "https://skinport.com/x", tradable=None),
-            "AWP | Asiimov (Field-Tested)":   Listing("Skinport", "AWP | Asiimov (Field-Tested)", 55.00, "https://skinport.com/y", tradable=None),
-        },
-        "CSFloat": {
-            # cheap CSFloat listing + CSFloat buy order above it -> same-platform mispricing
-            "AK-47 | Redline (Field-Tested)": Listing("CSFloat", "AK-47 | Redline (Field-Tested)", 18.50, "https://csfloat.com/item/1", tradable=True, listing_id="1"),
-            # tradable -> valid cross-platform to DMarket
-            "Glock-18 | Fade (Factory New)":  Listing("CSFloat", "Glock-18 | Fade (Factory New)", 400.00, "https://csfloat.com/item/2", tradable=True, listing_id="2"),
-            # locked -> filtered out of cross-platform
-            "M4A4 | Howl (Minimal Wear)":     Listing("CSFloat", "M4A4 | Howl (Minimal Wear)", 3000.00, "https://csfloat.com/item/3", tradable=False, listing_id="3"),
-        },
-        "DMarket": {
-            "AWP | Asiimov (Field-Tested)":   Listing("DMarket", "AWP | Asiimov (Field-Tested)", 50.00, "https://dmarket.com/z", tradable=True),
-        },
-    }
+    """Synthetic data exercising every accept path AND every rejection counter.
+    Run with MIN_SPREAD_PCT=8 to see all accepted cases. Fixtures go through
+    the same ingest_listing() path as real fetchers, so condition checks fire."""
+    SALES_7D.update({
+        "AK-47 | Redline (Field-Tested)": 40,
+        "Glock-18 | Fade (Factory New)": 12,
+        "AWP | Asiimov (Field-Tested)": 25,
+        "M4A4 | Howl (Minimal Wear)": 5,
+        "P250 | Sand Dune (Field-Tested)": 30,
+        "MP9 | Storm (Minimal Wear)": 22,
+        "Tec-9 | Nuclear Threat (Minimal Wear)": 10,
+        "Five-SeveN | Case Hardened (Field-Tested)": 15,
+        "SSG 08 | Abyss (Field-Tested)": 1,          # -> low_sales
+        "AK-47 | Asiimov (Field-Tested)": 33,
+    })
+
+    sp, cf, dm, roll = {}, {}, {}, {}
+
+    # A. Same-platform mispricing (CSFloat listing under CSFloat top bid).
+    ingest_listing(cf, "CSFloat", "AK-47 | Redline (Field-Tested)", 18.50,
+                   "https://csfloat.com/item/1", tradable=True, listing_id="1", ref_input=20.0)
+    #    Skinport listing, lock unknown -> its cross pair gets tradable_unknown.
+    ingest_listing(sp, "Skinport", "AK-47 | Redline (Field-Tested)", 20.00,
+                   "https://skinport.com/x", tradable=None)
+
+    # B. Valid cross-platform: CSFloat (tradable) -> DMarket bid.
+    ingest_listing(cf, "CSFloat", "Glock-18 | Fade (Factory New)", 400.00,
+                   "https://csfloat.com/item/2", tradable=True, listing_id="2", ref_input=440.0)
+
+    # C. Not-instant fallback: DMarket buy -> undercut Skinport's lowest ask (no bids anywhere).
+    ingest_listing(dm, "DMarket", "AWP | Asiimov (Field-Tested)", 50.00,
+                   "https://dmarket.com/z", tradable=True, ref_input=55.0)
+    ingest_listing(sp, "Skinport", "AWP | Asiimov (Field-Tested)", 60.00,
+                   "https://skinport.com/y", tradable=None)
+
+    # D. Trade-locked: same-platform allowed (labeled), cross rejected.
+    ingest_listing(cf, "CSFloat", "M4A4 | Howl (Minimal Wear)", 3000.00,
+                   "https://csfloat.com/item/3", tradable=False, listing_id="3", ref_input=3500.0)
+
+    # F. Outlier listing: ask 60% below reference -> rejected before math.
+    ingest_listing(cf, "CSFloat", "P250 | Sand Dune (Field-Tested)", 40.00,
+                   "https://csfloat.com/item/4", tradable=True, listing_id="4", ref_input=100.0)
+
+    # G. Outlier bid: bid 50% above reference -> rejected.
+    ingest_listing(cf, "CSFloat", "MP9 | Storm (Minimal Wear)", 28.00,
+                   "https://csfloat.com/item/5", tradable=True, listing_id="5", ref_input=30.0)
+
+    # H. Implausible spread: both legs within deviation but spread ~47% -> capped.
+    ingest_listing(dm, "DMarket", "Tec-9 | Nuclear Threat (Minimal Wear)", 80.00,
+                   "https://dmarket.com/tec9", tradable=True, ref_input=100.0)
+
+    # I. Thin depth: qty-1 top bid -> rejected as bait.
+    ingest_listing(cf, "CSFloat", "Five-SeveN | Case Hardened (Field-Tested)", 45.00,
+                   "https://csfloat.com/item/6", tradable=True, listing_id="6", ref_input=50.0)
+
+    # J. Low sales: 1 sale/7d < MIN_RECENT_SALES.
+    ingest_listing(cf, "CSFloat", "SSG 08 | Abyss (Field-Tested)", 20.00,
+                   "https://csfloat.com/item/7", tradable=True, listing_id="7", ref_input=21.0)
+
+    # K. Doppler phase handling: unknown phase dropped; known phases match.
+    ingest_listing(sp, "Skinport", "★ Karambit | Doppler (Factory New)", 850.00,
+                   "https://skinport.com/k", tradable=None)          # -> phase_unknown
+    ingest_listing(cf, "CSFloat", "★ Karambit | Doppler (Factory New)", 900.00,
+                   "https://csfloat.com/item/8", tradable=True, listing_id="8",
+                   phase="Phase 2", ref_input=1000.0)
+
+    # L. Condition mismatch: StatTrak flag contradicts the name -> dropped.
+    ingest_listing(cf, "CSFloat", "USP-S | Kill Confirmed (Minimal Wear)", 120.00,
+                   "https://csfloat.com/item/9", tradable=True, listing_id="9",
+                   is_stattrak=True, ref_input=125.0)
+
+    # M. CSGORoll coin-priced buy leg (100 coins @ 0.66 = $66), labeled non-cash.
+    ingest_listing(roll, "CSGORoll", "AK-47 | Asiimov (Field-Tested)", 100 * CSGOROLL_COIN_USD,
+                   "https://www.csgoroll.com/en/withdraw/csgo", tradable=True,
+                   cash_equivalent=False, ref_input=78.0)
+
+    listings_by_platform = {"Skinport": sp, "CSFloat": cf, "DMarket": dm, "CSGORoll": roll}
+
     orders_by_platform = {
         "CSFloat": {
-            # top bid above the CSFloat listing (18.50) -> same-platform mispricing
-            "AK-47 | Redline (Field-Tested)": BuyOrder("CSFloat", "AK-47 | Redline (Field-Tested)", 23.00, "https://csfloat.com/item/1", depth=5),
-            # bid for the locked Howl -> cross from CSFloat is filtered (locked)
-            "M4A4 | Howl (Minimal Wear)":     BuyOrder("CSFloat", "M4A4 | Howl (Minimal Wear)", 3800.00, "https://csfloat.com/howl", depth=1),
+            "AK-47 | Redline (Field-Tested)":
+                BuyOrder("CSFloat", "AK-47 | Redline (Field-Tested)", 23.00, "https://csfloat.com/item/1", depth=5),
+            "M4A4 | Howl (Minimal Wear)":
+                BuyOrder("CSFloat", "M4A4 | Howl (Minimal Wear)", 3800.00, "https://csfloat.com/howl", depth=2),
+            "Tec-9 | Nuclear Threat (Minimal Wear)":
+                BuyOrder("CSFloat", "Tec-9 | Nuclear Threat (Minimal Wear)", 120.00, "https://csfloat.com/tec9", depth=4),
         },
         "DMarket": {
-            # high bid for Fade -> cross-platform CSFloat(buy)->DMarket(sell), tradable
-            "Glock-18 | Fade (Factory New)":  BuyOrder("DMarket", "Glock-18 | Fade (Factory New)", 470.00, "https://dmarket.com/fade", depth=3),
-            # bid for Asiimov -> cross DMarket(buy 50)->? only 55 Skinport listing, and DMarket listing 50; sell DMarket bid 60
-            "AWP | Asiimov (Field-Tested)":   BuyOrder("DMarket", "AWP | Asiimov (Field-Tested)", 62.00, "https://dmarket.com/asiimov", depth=1),
+            "Glock-18 | Fade (Factory New)":
+                BuyOrder("DMarket", "Glock-18 | Fade (Factory New)", 470.00, "https://dmarket.com/fade", depth=3),
+            "M4A4 | Howl (Minimal Wear)":
+                BuyOrder("DMarket", "M4A4 | Howl (Minimal Wear)", 3800.00, "https://dmarket.com/howl", depth=3),
+            "MP9 | Storm (Minimal Wear)":
+                BuyOrder("DMarket", "MP9 | Storm (Minimal Wear)", 45.00, "https://dmarket.com/storm", depth=5),
+            "Five-SeveN | Case Hardened (Field-Tested)":
+                BuyOrder("DMarket", "Five-SeveN | Case Hardened (Field-Tested)", 55.00, "https://dmarket.com/cs", depth=1),
+            "SSG 08 | Abyss (Field-Tested)":
+                BuyOrder("DMarket", "SSG 08 | Abyss (Field-Tested)", 25.00, "https://dmarket.com/abyss", depth=4),
+            "★ Karambit | Doppler (Factory New) · Phase 2":
+                BuyOrder("DMarket", "★ Karambit | Doppler (Factory New) · Phase 2", 1050.00, "https://dmarket.com/kara", depth=2),
+            "AK-47 | Asiimov (Field-Tested)":
+                BuyOrder("DMarket", "AK-47 | Asiimov (Field-Tested)", 80.00, "https://dmarket.com/asiimov-ak", depth=3),
+            "P250 | Sand Dune (Field-Tested)":
+                BuyOrder("DMarket", "P250 | Sand Dune (Field-Tested)", 95.00, "https://dmarket.com/sd", depth=5),
         },
     }
     return listings_by_platform, orders_by_platform
