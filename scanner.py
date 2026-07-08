@@ -116,7 +116,14 @@ def fetch_csfloat_prices() -> dict:
 
     url = "https://csfloat.com/api/v1/listings"
     headers = {"Authorization": CSFLOAT_API_KEY}
-    params = {"sort_by": "lowest_price", "limit": 50}
+    # min_price (in cents) matters: without it, lowest_price sort returns the
+    # cheapest listings sitewide (penny stickers), which all fall below
+    # MIN_ITEM_PRICE_USD and leave nothing to compare.
+    params = {
+        "sort_by": "lowest_price",
+        "limit": 50,
+        "min_price": int(MIN_ITEM_PRICE_USD * 100),
+    }
 
     prices = {}
     cursor = None
@@ -233,7 +240,8 @@ def send_discord_alert(opportunities: list):
     # Discord has a 2000 char limit per message; split if needed
     for i in range(0, len(content), 1900):
         chunk = content[i:i + 1900]
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": chunk}, timeout=REQUEST_TIMEOUT)
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": chunk}, timeout=REQUEST_TIMEOUT)
+        print(f"Discord webhook response: {resp.status_code}")
 
 
 def main():
