@@ -28,6 +28,7 @@ Notes on fees (update these if the platforms change their fee structure):
 import os
 import time
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import quote
 
 try:
@@ -73,14 +74,21 @@ class Opportunity:
     spread_pct: float
     buy_url: str
     sell_url: str
+    # How far the buy-side listing sits below the buy platform's own market
+    # reference price. None when the platform gave us no reference to compare
+    # against; a negative value means the buy is ABOVE market (a red flag that
+    # the spread is likely a stale/mismatched sell quote, not a real deal).
+    buy_market_ref: Optional[float] = None
+    buy_under_market_pct: Optional[float] = None
 
 
 def fetch_skinport_prices() -> dict:
     """
-    Returns {item_name: (price_usd, item_url)} using Skinport's public,
-    no-auth-required pricing endpoint. Skinport aggregates by item, so this
-    gives the lowest current listing per item, plus the item's real page URL
-    (the API returns `item_page`, so no slug guessing needed).
+    Returns {item_name: (price_usd, item_url, market_ref)} using Skinport's
+    public, no-auth-required pricing endpoint. Skinport aggregates by item, so
+    this gives the lowest current listing per item, the item's real page URL
+    (the API returns `item_page`, so no slug guessing needed), and Skinport's
+    own reference price (or None) for the under-market check.
     Docs: https://docs.skinport.com/items
     Rate limit: 8 requests / 5 min; the feed itself is cached ~5 min.
     """
@@ -101,14 +109,25 @@ def fetch_skinport_prices() -> dict:
             item_url = item.get("item_page") or (
                 "https://skinport.com/market?search=" + quote(name)
             )
-            prices[name] = (float(price), item_url)
+            # Skinport's own reference for the item, used to flag under-market
+            # buys. suggested_price is the headline reference; fall back to
+            # median/mean if it's absent. None disables the flag for this item.
+            ref = (
+                item.get("suggested_price")
+                or item.get("median_price")
+                or item.get("mean_price")
+            )
+            market_ref = float(ref) if ref else None
+            prices[name] = (float(price), item_url, market_ref)
     return prices
 
 
 def fetch_csfloat_prices() -> dict:
     """
-    Returns {item_name: (price_usd, listing_url)} using CSFloat's listings
-    endpoint, sorted by lowest price. Requires an API key.
+    Returns {item_name: (price_usd, listing_url, market_ref)} using CSFloat's
+    listings endpoint, sorted by lowest price. market_ref is CSFloat's own
+    reference price for that listing (or None), used for the under-market
+    check. Requires an API key.
     Docs: https://csfloat.com/api/docs
     """
     if not CSFLOAT_API_KEY:
@@ -164,14 +183,30 @@ def fetch_csfloat_prices() -> dict:
             listing_id = listing.get("id")
             if name and price_cents:
                 price = price_cents / 100.0
+                # CSFloat's per-listing reference price (in cents) — the
+                # platform's estimated market value, used to flag under-market
+                # buys. Fall back to base_price if predicted_price is absent.
+                reference = listing.get("reference") or {}
+                ref_cents = reference.get("predicted_price") or reference.get("base_price")
+                market_ref = ref_cents / 100.0 if ref_cents else None
                 # Keep the lowest price seen per item name
                 if name not in prices or price < prices[name][0]:
-                    prices[name] = (price, f"https://csfloat.com/item/{listing_id}")
+                    prices[name] = (price, f"https://csfloat.com/item/{listing_id}", market_ref)
         pages_fetched += 1
         if not cursor:
             break
 
     return prices
+
+
+def _under_market_pct(price: float, market_ref: Optional[float]) -> Optional[float]:
+    """How far below the platform's market reference `price` sits, as a
+    percentage. None if there's no reference to compare against. A negative
+    result means the price is ABOVE market — a flag that a flagged spread is
+    probably a stale or mismatched quote rather than a genuine deal."""
+    if not market_ref or market_ref <= 0:
+        return None
+    return (market_ref - price) / market_ref * 100
 
 
 def find_opportunities(skinport_prices: dict, csfloat_prices: dict) -> list:
@@ -180,8 +215,8 @@ def find_opportunities(skinport_prices: dict, csfloat_prices: dict) -> list:
     all_items = set(skinport_prices.keys()) & set(csfloat_prices.keys())
 
     for name in all_items:
-        sp_price, sp_url = skinport_prices[name]
-        cf_price, cf_url = csfloat_prices[name]
+        sp_price, sp_url, sp_ref = skinport_prices[name]
+        cf_price, cf_url, cf_ref = csfloat_prices[name]
 
         if sp_price < MIN_ITEM_PRICE_USD and cf_price < MIN_ITEM_PRICE_USD:
             continue
@@ -199,6 +234,8 @@ def find_opportunities(skinport_prices: dict, csfloat_prices: dict) -> list:
                 spread_pct=spread,
                 buy_url=cf_url,
                 sell_url=sp_url,
+                buy_market_ref=cf_ref,
+                buy_under_market_pct=_under_market_pct(cf_price, cf_ref),
             ))
 
         # Direction 2: buy on Skinport, sell on CSFloat
@@ -214,10 +251,25 @@ def find_opportunities(skinport_prices: dict, csfloat_prices: dict) -> list:
                 spread_pct=spread,
                 buy_url=sp_url,
                 sell_url=cf_url,
+                buy_market_ref=sp_ref,
+                buy_under_market_pct=_under_market_pct(sp_price, sp_ref),
             ))
 
     opportunities.sort(key=lambda o: o.spread_pct, reverse=True)
     return opportunities
+
+
+def _under_market_label(o: Opportunity) -> str:
+    """Human-readable under-market signal for one opportunity's buy leg."""
+    if o.buy_under_market_pct is None:
+        return "under market: n/a (no reference price)"
+    pct = o.buy_under_market_pct
+    if pct >= 0:
+        return f"under market: {pct:.1f}% below {o.buy_platform} ref (${o.buy_market_ref:.2f})"
+    return (
+        f"ABOVE market: {abs(pct):.1f}% over {o.buy_platform} ref "
+        f"(${o.buy_market_ref:.2f}) — verify listing"
+    )
 
 
 def send_discord_alert(opportunities: list):
@@ -230,10 +282,12 @@ def send_discord_alert(opportunities: list):
 
     lines = ["**CS2 Skin Arbitrage — opportunities found:**\n"]
     for o in opportunities[:15]:  # cap message size
+        warn = "⚠️ " if (o.buy_under_market_pct is not None and o.buy_under_market_pct < 0) else ""
         lines.append(
             f"**{o.item_name}** — {o.spread_pct:.1f}% net spread\n"
             f"Buy: {o.buy_platform} @ ${o.buy_price:.2f} — {o.buy_url}\n"
             f"Sell: {o.sell_platform} @ ${o.sell_price_after_fee:.2f} (after fees) — {o.sell_url}\n"
+            f"{warn}{_under_market_label(o)}\n"
         )
     content = "\n".join(lines)
 
@@ -262,7 +316,7 @@ def main():
 
     print(f"\nFound {len(opportunities)} opportunities:\n")
     for o in opportunities[:15]:
-        print(f"{o.item_name} | {o.spread_pct:.1f}% | Buy {o.buy_platform} ${o.buy_price:.2f} -> Sell {o.sell_platform} ${o.sell_price_after_fee:.2f}")
+        print(f"{o.item_name} | {o.spread_pct:.1f}% | Buy {o.buy_platform} ${o.buy_price:.2f} -> Sell {o.sell_platform} ${o.sell_price_after_fee:.2f} | {_under_market_label(o)}")
 
     send_discord_alert(opportunities)
 
